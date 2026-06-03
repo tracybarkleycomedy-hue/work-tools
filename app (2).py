@@ -8,6 +8,49 @@ import streamlit as st
 
 st.set_page_config(page_title="Betty Ingestion Assistant", layout="wide")
 
+# --------------------------------------------------
+# WEBSITE SCAN
+# --------------------------------------------------
+def scan_homepage(url: str):
+    if not url:
+        return {
+            "accessible": False,
+            "status_code": None,
+            "final_url": "",
+            "detection_message": "Enter a website URL.",
+            "error": "No URL provided.",
+        }
+
+    site = url.strip()
+    if not site.startswith("http://") and not site.startswith("https://"):
+        site = f"https://{site}"
+
+    try:
+        response = requests.get(
+            site,
+            timeout=10,
+            headers={"User-Agent": "Mozilla/5.0"},
+            allow_redirects=True,
+        )
+
+        accessible = response.status_code < 400
+        return {
+            "accessible": accessible,
+            "status_code": response.status_code,
+            "final_url": response.url,
+            "detection_message": "Homepage accessible." if accessible else f"Homepage returned HTTP {response.status_code}.",
+            "error": "",
+        }
+
+    except Exception as e:
+        return {
+            "accessible": False,
+            "status_code": None,
+            "final_url": site,
+            "detection_message": f"Homepage scan failed: {e}",
+            "error": str(e),
+        }
+
 
 # --------------------------------------------------
 # CMS DETECTION
@@ -152,7 +195,7 @@ def detect_external_platforms(url: str):
 # --------------------------------------------------
 def detect_sitemap(url: str):
     if not url:
-        return False, ""
+        return False, "", None
 
     base = url.strip()
     if not base.startswith("http://") and not base.startswith("https://"):
@@ -183,12 +226,13 @@ def detect_sitemap(url: str):
                 or "<sitemapindex" in content
                 or "xml" in content_type
             ):
-                return True, candidate
+                is_index = "<sitemapindex" in content
+                return True, candidate, is_index
 
         except Exception:
             continue
 
-    return False, ""
+    return False, "", None
 
 
 # --------------------------------------------------
@@ -401,32 +445,39 @@ def discover_api_endpoints(base_url: str, cms: str):
 
     results = []
 
-    for path in cms_paths.get(cms, []):
-        full_url = f"{site}{path}"
+    cms_items = cms_paths.items() if cms in ["All", "Unknown", "Other", None] else [(cms, cms_paths.get(cms, []))]
 
-        try:
-            response = requests.get(
-                full_url,
-                timeout=8,
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
+    for cms_name, paths in cms_items:
+        for path in paths:
+            full_url = f"{site}{path}"
 
-            results.append(
-                {
-                    "endpoint": full_url,
-                    "status_code": response.status_code,
-                    "reachable": response.status_code < 400,
-                }
-            )
+            try:
+                response = requests.get(
+                    full_url,
+                    timeout=8,
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
 
-        except Exception:
-            results.append(
-                {
-                    "endpoint": full_url,
-                    "status_code": "error",
-                    "reachable": False,
-                }
-            )
+                results.append(
+                    {
+                        "cms": cms_name,
+                        "endpoint": full_url,
+                        "status_code": response.status_code,
+                        "reachable": response.status_code < 400,
+                        "auth_required": response.status_code in [401, 403],
+                    }
+                )
+
+            except Exception:
+                results.append(
+                    {
+                        "cms": cms_name,
+                        "endpoint": full_url,
+                        "status_code": "error",
+                        "reachable": False,
+                        "auth_required": False,
+                    }
+                )
 
     return results
 
@@ -1132,6 +1183,42 @@ def quick_risk_label(risks_text):
     return "Low"
 
 
+
+
+def summarize_sitemap_inventory(inventory):
+    summary = {}
+    for row in inventory or []:
+        category = row.get("category", "Unknown")
+        summary[category] = summary.get(category, 0) + 1
+    return dict(sorted(summary.items(), key=lambda item: (-item[1], item[0])))
+
+
+def build_cms_endpoint_map(api_endpoints):
+    endpoint_map = {}
+    for row in api_endpoints or []:
+        cms_name = row.get("cms", "Unknown")
+        if cms_name not in endpoint_map:
+            endpoint_map[cms_name] = {"probed": 0, "reachable": 0, "auth_required": 0, "missing": 0}
+
+        endpoint_map[cms_name]["probed"] += 1
+
+        status = row.get("status_code")
+        if row.get("reachable"):
+            endpoint_map[cms_name]["reachable"] += 1
+        elif status in [401, 403]:
+            endpoint_map[cms_name]["auth_required"] += 1
+        elif status == 404:
+            endpoint_map[cms_name]["missing"] += 1
+
+    return endpoint_map
+
+
+def filter_auth_required_endpoints(api_endpoints):
+    return [
+        row for row in api_endpoints or []
+        if row.get("status_code") in [401, 403]
+    ]
+
 # --------------------------------------------------
 # AGENT JSON OUTPUT
 # --------------------------------------------------
@@ -1193,6 +1280,7 @@ def build_agent_json_payload(data, strategy, secondary, risks, internal_notes, d
             "name": data.get("client_name", ""),
             "website": data.get("website", ""),
         },
+        "website_scan": data.get("website_scan", {}),
         "platform": {
             "cms": data.get("cms", "Unknown"),
             "public_content_only": data.get("public_content"),
@@ -1226,7 +1314,9 @@ def build_agent_json_payload(data, strategy, secondary, risks, internal_notes, d
         "sitemap": {
             "found": data.get("sitemap_found", False),
             "url": data.get("sitemap_message", ""),
+            "is_index": data.get("sitemap_is_index"),
             "page_count": data.get("sitemap_page_count"),
+            "category_summary": data.get("sitemap_category_summary", summarize_sitemap_inventory(data.get("sitemap_inventory", []))),
             "inventory": data.get("sitemap_inventory", []),
         },
         "api_discovery": {
@@ -1234,6 +1324,8 @@ def build_agent_json_payload(data, strategy, secondary, risks, internal_notes, d
             "reachable_endpoints": [
                 row for row in data.get("api_endpoints", []) if row.get("reachable")
             ],
+            "auth_required_endpoints": filter_auth_required_endpoints(data.get("api_endpoints", [])),
+            "cms_endpoint_map": build_cms_endpoint_map(data.get("api_endpoints", [])),
         },
         "external_platforms": {
             "vimeo": data.get("vimeo_found", False),
@@ -1277,7 +1369,9 @@ for key, default in {
     "suggested_sources": [],
     "sitemap_found": False,
     "sitemap_message": "",
+    "sitemap_is_index": None,
     "sitemap_page_count": None,
+    "website_scan": {},
     "sitemap_inventory": [],
     "api_endpoints": [],
     "member_login_found": False,
@@ -1326,17 +1420,19 @@ with left:
     public_content = st.radio("Public Content Only?", ["Yes", "No"], horizontal=True)
 
     if st.button("🔎 Detect CMS + Sitemap + API + Login + Platforms", use_container_width=True):
+        st.session_state.website_scan = scan_homepage(website)
         cms, detection_message = detect_cms_from_website(website)
         st.session_state.cms = cms
         st.session_state.detection_message = detection_message
 
-        sitemap_found, sitemap_message = detect_sitemap(website)
+        sitemap_found, sitemap_message, sitemap_is_index = detect_sitemap(website)
         st.session_state.sitemap_found = sitemap_found
         st.session_state.sitemap_message = sitemap_message
+        st.session_state.sitemap_is_index = sitemap_is_index
         st.session_state.sitemap_page_count = count_urls_in_sitemap(sitemap_message) if sitemap_found else None
         st.session_state.sitemap_inventory = extract_sitemap_inventory(sitemap_message) if sitemap_found else []
 
-        st.session_state.api_endpoints = discover_api_endpoints(website, cms)
+        st.session_state.api_endpoints = discover_api_endpoints(website, "All")
 
         login_found, login_signals = detect_member_login(website)
         st.session_state.member_login_found = login_found
@@ -1347,6 +1443,13 @@ with left:
         st.session_state.google_found = platforms["google_drive"]
         st.session_state.sharepoint_found = platforms["sharepoint"]
         st.session_state.external_signals = platforms["signals"]
+
+    if st.session_state.get("website_scan"):
+        scan = st.session_state.website_scan
+        if scan.get("accessible"):
+            st.success(f"Homepage accessible: HTTP {scan.get('status_code')}")
+        else:
+            st.warning(scan.get("detection_message", "Homepage was not accessible."))
 
     if st.session_state.detection_message:
         if st.session_state.cms != "Unknown":
@@ -1485,10 +1588,13 @@ if st.session_state.submitted:
         "pdf_text_based": pdf_text_based,
         "transcripts_available": transcripts_available,
         "additional_notes": additional_notes,
+        "website_scan": st.session_state.get("website_scan", {}),
         "sitemap_found": st.session_state.get("sitemap_found", False),
         "sitemap_message": st.session_state.get("sitemap_message", ""),
+        "sitemap_is_index": st.session_state.get("sitemap_is_index", None),
         "sitemap_page_count": st.session_state.get("sitemap_page_count", None),
         "sitemap_inventory": st.session_state.get("sitemap_inventory", []),
+        "sitemap_category_summary": summarize_sitemap_inventory(st.session_state.get("sitemap_inventory", [])),
         "api_endpoints": st.session_state.get("api_endpoints", []),
         "member_login_found": st.session_state.get("member_login_found", False),
         "member_login_signals": st.session_state.get("member_login_signals", []),
@@ -1621,7 +1727,7 @@ if st.session_state.submitted:
         st.text(draft_email)
 
     with tabs[8]:
-        st.caption("Structured handoff object for another agent to consume.")
+        st.caption("Structured handoff object for another agent to consume, including website scan, sitemap index flag, category summary, CMS endpoint map, and auth-required endpoints.")
         st.json(agent_payload)
 
     st.divider()
